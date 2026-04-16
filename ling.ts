@@ -64,25 +64,78 @@ async function agent(userMessage: string) {
   ];
 
   while (true) {
-    const res = await client.chat.completions.create({ model: MODEL, messages, tools });
-    const choice = res.choices[0];
-    messages.push(choice.message);
+    const stream = await client.chat.completions.create({ 
+      model: MODEL, 
+      messages, 
+      tools,
+      stream: true  // 开启流式输出
+    });
 
-    if (choice.finish_reason !== "tool_calls" || !choice.message.tool_calls) {
-      console.log(choice.message.content);
+    let fullContent = '';
+    let toolCalls: ToolCall[] = [];
+    let finishReason: string | null = null;
+
+    // 处理流式响应
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta;
+      
+      // 收集文本内容
+      if (delta?.content) {
+        process.stdout.write(delta.content);  // 实时输出
+        fullContent += delta.content;
+      }
+
+      // 收集工具调用
+      if (delta?.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          // 流式响应的类型定义不完整，使用 any 绕过类型检查
+          const toolCall = tc as any;
+          
+          if (!toolCall.function) continue;
+          
+          if (!toolCalls[toolCall.index]) {
+            toolCalls[toolCall.index] = {
+              id: toolCall.id || '',
+              type: 'function',
+              function: { name: '', arguments: '' }
+            };
+          }
+          if (toolCall.function.name) toolCalls[toolCall.index].function.name = toolCall.function.name;
+          if (toolCall.function.arguments) toolCalls[toolCall.index].function.arguments += toolCall.function.arguments;
+        }
+      }
+
+      // 记录结束原因
+      if (chunk.choices[0]?.finish_reason) {
+        finishReason = chunk.choices[0].finish_reason;
+      }
+    }
+
+    // 构建完整的消息对象
+    const assistantMessage: Message = {
+      role: 'assistant',
+      content: fullContent || null,
+      tool_calls: toolCalls.length > 0 ? toolCalls : undefined
+    };
+    messages.push(assistantMessage);
+
+    // 如果没有工具调用，结束循环
+    if (finishReason !== "tool_calls" || toolCalls.length === 0) {
+      console.log();  // 换行
       return;
     }
 
-    for (const tc of choice.message.tool_calls) {
+    console.log();  // 换行
+
+    // 执行工具调用
+    for (const tc of toolCalls) {
       if (tc.type !== 'function') continue;
       const args = JSON.parse(tc.function.arguments);
       const result = executeTool(tc.function.name, args);
       console.log(`[tool] ${tc.function.name}(${JSON.stringify(args)}) → ${result.slice(0, 100)}...`);
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
     }
-
   }
-
 }
 
 agent(process.argv[2] || "Read package.json and summarize this project.");
