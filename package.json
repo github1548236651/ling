@@ -1,13 +1,26 @@
 {
   "type": "module",
   "scripts": {
-    "start": "npx tsx ling.ts"
+    "start": "npx tsx src/ling.ts",
+    "server": "npx tsx src/server.ts",
+    "mcp": "npx tsx src/mcp-server.ts",
+    "web": "cd web && npm run dev",
+    "dev": "concurrently \"npm run server\" \"npm run web\"",
+    "install:web": "cd web && npm install"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.90.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "cors": "^2.8.5",
     "dotenv": "^17.4.2",
+    "express": "^4.21.2",
+    "glob": "^13.0.6",
     "openai": "^6.34.0"
   },
   "devDependencies": {
-    "@types/node": "^25.6.0"
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^25.6.0",
+    "concurrently": "^9.1.2"
   }
 }

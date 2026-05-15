@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ling-agent": {
+      "command": "npm",
+      "args": ["run", "mcp"],
+      "cwd": "/Users/jindun/Desktop/myCode/ling",
+      "env": {},
+      "disabled": false,
+      "autoApprove": ["read_file", "list_files", "grep", "glob"]
+    }
+  }
+}
