@@ -13,7 +13,7 @@ import { PermissionGuard, loadPermissionConfig } from "./permissions/index.js";
 type Tool = OpenAI.Chat.ChatCompletionTool;
 type Message = OpenAI.Chat.ChatCompletionMessageParam;
 
-const config = loadPermissionConfig();​
+const config = loadPermissionConfig();
 const guard = new PermissionGuard(config);
 
 const client = new OpenAI({
@@ -120,9 +120,24 @@ async function main() {
       }
 
       for (const tc of choice.message.tool_calls) {
+        if (!("function" in tc)) continue;
+        const name = tc.function.name;
         const args = JSON.parse(tc.function.arguments);
-        const result = executeTool(tc.function.name, args);
-        console.log(`[tool] ${tc.function.name}(${JSON.stringify(args)}) → ${result.slice(0, 100)}...`);
+
+        // ---- 权限检查：在执行前拦截 ----
+        const allowed = await guard.check(name, args);
+
+        if (!allowed) {
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: `Permission denied: this operation was blocked by the permission system. Try a different approach.`,
+          });
+          continue;  // 跳过执行，但不中断循环
+        }
+
+        const result = executeTool(name, args);
+        console.log(`[tool] ${name}(${JSON.stringify(args)}) → ${result.slice(0, 100)}...`);
         messages.push({ role: "tool", tool_call_id: tc.id, content: result });
       }
     }
