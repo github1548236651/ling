@@ -1,68 +1,73 @@
-import "dotenv/config";
-import OpenAI from "openai";
-import * as readline from "readline";
-import { createToolRegistry } from "./tools/index.js";
+// Ling Agent — 集成上下文引擎
+// ch04: System Prompt 分层 + 项目感知 + .ling.md + 长对话压缩
 
-// client 大模型实例
+import OpenAI from "openai";
+import { readFileSync } from "fs";
+import { execSync } from "child_process";
+import { createInterface } from "readline";
+import { buildSystemPrompt, calculateBudget, estimateTokens, Compactor } from "./context/index.ts";
+import "dotenv/config";
+import { PermissionGuard, loadPermissionConfig } from "./permissions/index.js";
+
+
+type Tool = OpenAI.Chat.ChatCompletionTool;
+type Message = OpenAI.Chat.ChatCompletionMessageParam;
+
+const config = loadPermissionConfig();​
+const guard = new PermissionGuard(config);
+
 const client = new OpenAI({
   apiKey: process.env.LLM_API_KEY,
-  baseURL: process.env.LLM_BASE_URL,
+  baseURL: process.env.LLM_BASE_URL || "https://ark.cn-beijing.volces.com/api/v3",
 });
-const registry = createToolRegistry();
-const model = process.env.LLM_MODEL || "gpt-4o";
+const MODEL = process.env.LLM_MODEL || "doubao-1.5-pro-32k-250115";
+const CONTEXT_WINDOW = parseInt(process.env.CONTEXT_WINDOW || "32000", 10);
 
-type Message = OpenAI.ChatCompletionMessageParam;
+// ===== 工具定义 =====
 
-const systemPrompt = `You are Ling, a coding assistant. You have access to tools to read, write, edit files, search code, and run commands. Use tools to accomplish tasks step by step.`;
+const tools: Tool[] = [
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "Read the contents of a file at the given path",
+      parameters: {
+        type: "object",
+        properties: { file_path: { type: "string", description: "Absolute or relative file path" } },
+        required: ["file_path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "run_command",
+      description: "Run a shell command and return its output",
+      parameters: {
+        type: "object",
+        properties: { command: { type: "string", description: "Shell command to execute" } },
+        required: ["command"],
+      },
+    },
+  },
+];
 
-async function agentLoop(userMessage: string, history: Message[]): Promise<string> {
-  history.push({ role: "user", content: userMessage });
-
-  while (true) {
-    const response = await client.chat.completions.create({
-      model,
-      messages: [{ role: "system", content: systemPrompt }, ...history],
-      tools: registry.toOpenAITools(),
-    });
-
-    const message = response.choices[0].message;
-    history.push(message as Message);
-
-    // 没有工具调用 → 返回最终回答
-    if (!message.tool_calls || message.tool_calls.length === 0) {
-      return message.content ?? "(no response)";
-    }
-
-    // 执行每个工具调用
-    for (const toolCall of message.tool_calls) {
-      const name = toolCall.function.name;
-      const params = JSON.parse(toolCall.function.arguments);
-
-      console.log(`  [tool] ${name}(${JSON.stringify(params).slice(0, 80)}...)`);
-
-      let result: string;
-      try {
-        result = await registry.execute(name, params);
-      } catch (err) {
-        result = `Error: ${(err as Error).message}`;
-      }
-
-      history.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: result,
-      });
-    }
-    // 带着工具结果继续循环
+function executeTool(name: string, args: Record<string, string>): string {
+  try {
+    if (name === "read_file") return readFileSync(args.file_path, "utf-8");
+    if (name === "run_command") return execSync(args.command, { encoding: "utf-8", timeout: 30000 }).toString();
+    return `Unknown tool: ${name}`;
+  } catch (e: any) {
+    return `Error: ${e.message}`;
   }
 }
 
-// ---- REPL 入口 ----
 async function main() {
   // 支持通过命令行参数指定工作目录
   const workDir = process.argv[2];
   if (workDir) {
     try {
+      // 切换到指定的工作目录
       process.chdir(workDir);
       console.log(`📁 Working directory: ${process.cwd()}\n`);
     } catch (err) {
@@ -71,26 +76,78 @@ async function main() {
     }
   }
 
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+  // ===== 上下文引擎初始化 =====
 
-  const history: Message[] = [];
-  console.log("Ling Agent (ch03) — type your request, Ctrl+C to exit\n");
+  const cwd = process.cwd();
+  const systemPrompt = buildSystemPrompt({ cwd });
+  const compactor = new Compactor(client, MODEL, { keepRecentTurns: 4, maxHistoryTokens: 50000 });
 
-  const prompt = () => {
-    rl.question("You: ", async (input) => {
-      if (!input.trim()) return prompt();
-      try {
-        const reply = await agentLoop(input, history);
-        console.log(`\nLing: ${reply}\n`);
-      } catch (err) {
-        console.error(`Error: ${(err as Error).message}\n`);
+  // 启动时打印预算信息
+  const toolDefs = JSON.stringify(tools);
+  const budget = calculateBudget(CONTEXT_WINDOW, systemPrompt, toolDefs, "");
+  console.log(`[ling] Project detected. System prompt: ${budget.systemPrompt} tokens`);
+  console.log(`[ling] Budget: ${budget.available} tokens available (${budget.reserved} reserved for tool results)`);
+
+  // ===== Agent 主循环 =====
+
+  let messages: Message[] = [{ role: "system", content: systemPrompt }];
+
+  async function handleTurn(userMessage: string) {
+    // /compact 命令：手动触发压缩
+    if (userMessage.trim() === "/compact") {
+      messages = await compactor.compact(messages);
+      console.log("[ling] Conversation compacted.");
+      return;
+    }
+
+    messages.push({ role: "user", content: userMessage });
+
+    // 自动压缩检查
+    if (compactor.shouldCompact(messages)) {
+      console.log("[ling] Context getting large, auto-compacting...");
+      messages = await compactor.compact(messages);
+    }
+
+    const MAX_TURNS = 20;
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
+      const res = await client.chat.completions.create({ model: MODEL, messages, tools });
+      const choice = res.choices[0];
+      messages.push(choice.message);
+
+      if (choice.finish_reason !== "tool_calls" || !choice.message.tool_calls) {
+        console.log(`\n${choice.message.content}\n`);
+        return;
       }
+
+      for (const tc of choice.message.tool_calls) {
+        const args = JSON.parse(tc.function.arguments);
+        const result = executeTool(tc.function.name, args);
+        console.log(`[tool] ${tc.function.name}(${JSON.stringify(args)}) → ${result.slice(0, 100)}...`);
+        messages.push({ role: "tool", tool_call_id: tc.id, content: result });
+      }
+    }
+
+    console.log("[ling] Reached max turns, stopping.");
+  }
+
+  // ===== REPL =====
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+  function prompt() {
+    const historyTokens = estimateTokens(JSON.stringify(messages));
+    rl.question(`[${historyTokens} tokens] > `, async (input) => {
+      const trimmed = input.trim();
+      if (!trimmed || trimmed === "/quit") {
+        rl.close();
+        return;
+      }
+      await handleTurn(trimmed);
       prompt();
     });
-  };
+  }
+
+  console.log("[ling] Ready. Type /compact to compress history, /quit to exit.\n");
   prompt();
 }
 

@@ -28,12 +28,6 @@ export function loadLingMd(cwd: string): LingMdResult[] {
       results.push({ path: filePath, content });
     }
 
-    // 🔑 如果找到 .git 目录，说明到达项目根目录，停止向上查找
-    const gitDir = join(dir, ".git");
-    if (existsSync(gitDir)) {
-      break;
-    }
-
     const parent = dirname(dir);
     if (parent === dir) break; // 到根了
     dir = parent;
