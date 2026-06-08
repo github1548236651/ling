@@ -4,6 +4,25 @@ import { minimatch } from "minimatch";
 import type { PermissionConfig, PermissionResult, ToolCallContext } from "./types.js";
 import { evaluate, extractPrimaryArg } from "./matcher.js";
 
+/** 检测可疑的工具参数内容 */
+const SUSPICIOUS_PATTERNS = [
+  /\bcurl\b.*\|\s*\bbash\b/i,
+  /\bwget\b.*\|\s*\bsh\b/i,
+  /\beval\b\s*\(/,
+  /;\s*rm\s+-rf/,          // 命令注入：正常命令后面藏了 rm -rf
+  /`[^`]*rm\s+-rf[^`]*`/,  // 反引号里藏命令
+  /\$\([^)]*rm\s+-rf/,     // $() 子命令里藏命令
+];
+
+function detectInjection(input: string): string | null {
+  for (const pattern of SUSPICIOUS_PATTERNS) {
+    if (pattern.test(input)) {
+      return `Suspicious pattern detected: ${pattern.source}`;
+    }
+  }
+  return null;
+}
+
 /**
  * PermissionGuard —— 权限守卫
  *
@@ -34,7 +53,14 @@ export class PermissionGuard {
       return this.askUser(toolName, primaryArg, `Protected path: ${protectedResult}`);
     }
 
-    // 第三关：规则评估
+    // 第三关：参数注入检测
+    const injectionResult = detectInjection(primaryArg);
+    if (injectionResult) {
+      console.error(`\n[DENIED] ${injectionResult}`);
+      return false;
+    }
+
+    // 第四关：规则评估
     const result = evaluate(this.config.rules, ctx);
 
     switch (result.action) {

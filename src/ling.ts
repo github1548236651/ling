@@ -8,6 +8,9 @@ import { createInterface } from "readline";
 import { buildSystemPrompt, calculateBudget, estimateTokens, Compactor } from "./context/index.ts";
 import "dotenv/config";
 import { PermissionGuard, loadPermissionConfig } from "./permissions/index.js";
+import { StreamChunk } from "./streaming/types.js";
+import { ToolCallCollector } from "./streaming/collector.js";
+import { StreamRenderer } from "./streaming/renderer.js";
 
 
 type Tool = OpenAI.Chat.ChatCompletionTool;
@@ -15,6 +18,39 @@ type Message = OpenAI.Chat.ChatCompletionMessageParam;
 
 const config = loadPermissionConfig();
 const guard = new PermissionGuard(config);
+
+interface CliArgs {
+  continue: boolean;       // --continue：恢复最近一次会话
+  resume?: string;         // --resume <id>：恢复指定会话
+  name?: string;           // --name <name>：给会话命名
+  listSessions: boolean;   // --list-sessions：列出历史
+}
+
+function parseArgs(argv: string[]): CliArgs {
+  const args: CliArgs = { continue: false, listSessions: false };
+
+  for (let i = 2; i < argv.length; i++) {
+    switch (argv[i]) {
+      case "--continue":
+      case "-c":
+        args.continue = true;
+        break;
+      case "--resume":
+      case "-r":
+        args.resume = argv[++i];
+        break;
+      case "--name":
+      case "-n":
+        args.name = argv[++i];
+        break;
+      case "--list-sessions":
+      case "-l":
+        args.listSessions = true;
+        break;
+    }
+  }
+  return args;
+}
 
 const client = new OpenAI({
   apiKey: process.env.LLM_API_KEY,
@@ -63,6 +99,7 @@ function executeTool(name: string, args: Record<string, string>): string {
 }
 
 async function main() {
+  
   // 支持通过命令行参数指定工作目录
   const workDir = process.argv[2];
   if (workDir) {
@@ -110,34 +147,112 @@ async function main() {
 
     const MAX_TURNS = 20;
     for (let turn = 0; turn < MAX_TURNS; turn++) {
-      const res = await client.chat.completions.create({ model: MODEL, messages, tools });
-      const choice = res.choices[0];
-      messages.push(choice.message);
+      const renderer = new StreamRenderer();
+      const collector = new ToolCallCollector();
+      let collectedContent = "";
 
-      if (choice.finish_reason !== "tool_calls" || !choice.message.tool_calls) {
-        console.log(`\n${choice.message.content}\n`);
+      // ---- 流式请求 ----
+      const stream = await client.chat.completions.create({
+        model: MODEL,
+        messages,
+        tools,
+        stream: true,
+      });
+
+      // 追踪本次请求中出现的 tool_call index
+      const seenToolCallIndices = new Set<number>();
+
+      for await (const chunk of stream) {
+        const delta = chunk.choices[0]?.delta;
+        const finishReason = chunk.choices[0]?.finish_reason;
+
+        // 文本 token → 实时输出
+        if (delta?.content) {
+          collectedContent += delta.content;
+          renderer.onChunk({ type: "text", content: delta.content });
+        }
+
+        // 工具调用增量
+        if (delta?.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+
+            // 首次出现（携带 id + function.name）→ tool_call_start
+            if (tc.id && tc.function?.name) {
+              seenToolCallIndices.add(idx);
+              const startChunk: StreamChunk = {
+                type: "tool_call_start",
+                content: "",
+                toolCallId: tc.id,
+                toolName: tc.function.name,
+                index: idx,
+              };
+              renderer.onChunk(startChunk);
+              collector.feed(startChunk);
+            }
+
+            // 参数增量片段
+            if (tc.function?.arguments) {
+              collector.feed({
+                type: "tool_call_delta",
+                content: tc.function.arguments,
+                index: idx,
+              });
+            }
+          }
+        }
+
+        // 流结束：工具调用模式 → 结束所有 pending 调用
+        if (finishReason === "tool_calls") {
+          for (const idx of seenToolCallIndices) {
+            collector.feed({ type: "tool_call_end", content: "", index: idx });
+          }
+        }
+
+        if (finishReason === "stop") {
+          renderer.onChunk({ type: "finish", content: "" });
+        }
+      }
+
+      // ---- 处理收集到的工具调用 ----
+      const toolCalls = collector.drain();
+
+      if (toolCalls.length === 0) {
+        // 没有工具调用，本轮结束
         return;
       }
 
-      for (const tc of choice.message.tool_calls) {
-        if (!("function" in tc)) continue;
-        const name = tc.function.name;
-        const args = JSON.parse(tc.function.arguments);
+      // 将 assistant 消息（含 tool_calls）写入历史
+      messages.push({
+        role: "assistant",
+        content: collectedContent || null,
+        tool_calls: toolCalls.map((tc) => ({
+          id: tc.id,
+          type: "function" as const,
+          function: { name: tc.name, arguments: tc.arguments },
+        })),
+      });
 
-        // ---- 权限检查：在执行前拦截 ----
-        const allowed = await guard.check(name, args);
+      for (const tc of toolCalls) {
+        const args = JSON.parse(tc.arguments);
+
+        // ---- 权限检查 + spinner ----
+        renderer.startToolExecution(tc.name, JSON.stringify(args));
+
+        const allowed = await guard.check(tc.name, args);
 
         if (!allowed) {
+          renderer.stopToolExecution(tc.name, false);
           messages.push({
             role: "tool",
             tool_call_id: tc.id,
             content: `Permission denied: this operation was blocked by the permission system. Try a different approach.`,
           });
-          continue;  // 跳过执行，但不中断循环
+          continue;
         }
 
-        const result = executeTool(name, args);
-        console.log(`[tool] ${name}(${JSON.stringify(args)}) → ${result.slice(0, 100)}...`);
+        const result = executeTool(tc.name, args);
+        renderer.stopToolExecution(tc.name, true);
         messages.push({ role: "tool", tool_call_id: tc.id, content: result });
       }
     }
