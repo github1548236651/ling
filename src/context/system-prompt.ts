@@ -6,12 +6,15 @@ import { loadLingMd, type LingMdResult } from "./ling-md.js";
 export interface SystemPromptOptions {
     cwd: string;
     customRules?: string; // 用户额外追加的规则
+    memoryContext?: string; // 长期记忆上下文
 }
 
 // 第一层： 角色定义
 const LAYER_ROLE = `You are Ling, a coding assistant built for real projects.
 You can read files, run commands, search code, and edit files.
-You think step by step, use tools to gather information before answering, and verify your work.`
+You think step by step, use tools to gather information before answering, and verify your work.
+When the user tells you something worth remembering (preferences, project conventions, corrections), you should call the save_memory tool to persist it across sessions.
+`
 
 const LAYER_RULES = `## Rules
 - Always read the relevant file before editing it.
@@ -55,7 +58,18 @@ function buildProjectLayer(project: ProjectInfo): string {
     return parts.join("\n");
 }
 
-// 第四层：.ling.md 用户指令
+// 第四层：长期记忆
+function buildMemoryLayer(memoryContext: string): string {
+    if (!memoryContext) return "";
+    return [
+        "## Long-Term Memory",
+        "The following information has been saved across sessions. Use it to personalize your responses.",
+        "",
+        memoryContext,
+    ].join("\n");
+}
+
+// 第五层：.ling.md 用户指令
 function buildLingMdLayer(lingMds: LingMdResult[]): string {
     if (lingMds.length === 0) return "";
 
@@ -73,10 +87,11 @@ export function buildSystemPrompt(options: SystemPromptOptions): string {
     const lingMds = loadLingMd(options.cwd);
 
     const sections = [
-        LAYER_ROLE,        // 第一层：你是谁​
-        LAYER_RULES,       // 第二层：通用规则​
-        buildProjectLayer(project),  // 第三层：项目状态​
-        buildLingMdLayer(lingMds),   // 第四层：用户指令​
+        LAYER_ROLE,                        // 第一层：你是谁
+        LAYER_RULES,                       // 第二层：通用规则
+        buildProjectLayer(project),        // 第三层：项目状态
+        buildMemoryLayer(options.memoryContext ?? ""),  // 第四层：长期记忆
+        buildLingMdLayer(lingMds),         // 第五层：用户指令
     ];
 
     return sections.filter(Boolean).join("\n\n");

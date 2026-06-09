@@ -2,7 +2,6 @@
 // ch04: System Prompt 分层 + 项目感知 + .ling.md + 长对话压缩
 
 import OpenAI from "openai";
-import { readFileSync } from "fs";
 import { execSync } from "child_process";
 import { createInterface } from "readline";
 import { buildSystemPrompt, calculateBudget, estimateTokens, Compactor } from "./context/index.ts";
@@ -11,10 +10,9 @@ import { PermissionGuard, loadPermissionConfig } from "./permissions/index.js";
 import { StreamChunk } from "./streaming/types.js";
 import { ToolCallCollector } from "./streaming/collector.js";
 import { StreamRenderer } from "./streaming/renderer.js";
-import { SessionStore, SessionSummary, Session, SessionMetadata } from "./session/index.ts";
+import { SessionStore, Session, SessionMetadata, MemoryStore } from "./session/index.ts";
+import { createToolRegistry } from "./tools/index.tsx";
 
-
-type Tool = OpenAI.Chat.ChatCompletionTool;
 
 const config = loadPermissionConfig();
 const guard = new PermissionGuard(config);
@@ -69,6 +67,44 @@ function detectMetadata(): SessionMetadata {
   };
 }
 
+// ---- Memory 工具 ----
+
+const memoryStore = new MemoryStore(process.cwd());
+const toolRegistry = createToolRegistry();
+
+// 注册记忆工具到统一注册中心
+toolRegistry.register({
+  name: "save_memory",
+  description:
+    "Save a piece of information that should be remembered across sessions. " +
+    "Use this for user preferences, project conventions, and feedback corrections.",
+  schema: {
+    type: "object",
+    properties: {
+      name: { type: "string", description: "Short title for this memory" },
+      description: { type: "string", description: "One-line summary" },
+      type: {
+        type: "string",
+        enum: ["user", "project", "feedback"],
+        description: "user=preference, project=convention, feedback=correction",
+      },
+      content: { type: "string", description: "Full content in Markdown" },
+    },
+    required: ["name", "description", "type", "content"],
+  },
+  async execute(params) {
+    const fileName = await memoryStore.write({
+      name: params.name as string,
+      description: params.description as string,
+      type: params.type as "user" | "project" | "feedback",
+      content: params.content as string,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    return `Memory saved: ${fileName}`;
+  },
+});
+
 const client = new OpenAI({
   apiKey: process.env.LLM_API_KEY,
   baseURL: process.env.LLM_BASE_URL || "https://ark.cn-beijing.volces.com/api/v3",
@@ -78,42 +114,7 @@ const CONTEXT_WINDOW = parseInt(process.env.CONTEXT_WINDOW || "32000", 10);
 
 // ===== 工具定义 =====
 
-const tools: Tool[] = [
-  {
-    type: "function",
-    function: {
-      name: "read_file",
-      description: "Read the contents of a file at the given path",
-      parameters: {
-        type: "object",
-        properties: { file_path: { type: "string", description: "Absolute or relative file path" } },
-        required: ["file_path"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "run_command",
-      description: "Run a shell command and return its output",
-      parameters: {
-        type: "object",
-        properties: { command: { type: "string", description: "Shell command to execute" } },
-        required: ["command"],
-      },
-    },
-  },
-];
-
-function executeTool(name: string, args: Record<string, string>): string {
-  try {
-    if (name === "read_file") return readFileSync(args.file_path, "utf-8");
-    if (name === "run_command") return execSync(args.command, { encoding: "utf-8", timeout: 30000 }).toString();
-    return `Unknown tool: ${name}`;
-  } catch (e: any) {
-    return `Error: ${e.message}`;
-  }
-}
+const tools: OpenAI.Chat.ChatCompletionTool[] = toolRegistry.toOpenAITools();
 
 async function main() {
   const args = parseArgs(process.argv);
@@ -181,7 +182,8 @@ async function main() {
   // ===== 上下文引擎初始化 =====
 
   const cwd = process.cwd();
-  const systemPrompt = buildSystemPrompt({ cwd });
+  const memoryContext = await memoryStore.loadForContext();
+  const systemPrompt = buildSystemPrompt({ cwd, memoryContext });
   const compactor = new Compactor(client, MODEL, { keepRecentTurns: 4, maxHistoryTokens: 50000 });
 
   // 启动时打印预算信息
@@ -322,7 +324,7 @@ async function main() {
           continue;
         }
 
-        const result = executeTool(tc.name, args);
+        const result = await toolRegistry.execute(tc.name, args);
         renderer.stopToolExecution(tc.name, true);
         session.messages.push({ role: "tool", tool_call_id: tc.id, content: result });
       }
@@ -334,18 +336,39 @@ async function main() {
   // ===== REPL =====
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
+  let turnCount = 0;
+  const SAVE_INTERVAL = 5; // 每 5 轮自动保存一次
+
+  // 拦截 Ctrl+C，退出前保存会话
+  process.on("SIGINT", async () => {
+    console.log("\n[ling] Saving session before exit...");
+    await store.save(session);
+    console.log(`[ling] Session ${session.id.slice(0, 8)} saved. Goodbye.`);
+    process.exit(0);
+  });
+
+  async function saveAndQuit() {
+    console.log("[ling] Saving session...");
+    await store.save(session);
+    console.log(`[ling] Session ${session.id.slice(0, 8)} saved. Goodbye.`);
+    rl.close();
+  }
 
   function prompt() {
     const historyTokens = estimateTokens(JSON.stringify(session.messages));
     rl.question(`[${historyTokens} tokens] > `, async (input) => {
       const trimmed = input.trim();
       if (!trimmed || trimmed === "/quit") {
-        rl.close();
+        await saveAndQuit();
         return;
       }
       await handleTurn(trimmed);
-      // 每轮对话后自动保存
-      await store.save(session);
+      turnCount++;
+
+      // 每 SAVE_INTERVAL 轮自动保存一次，防止崩溃丢失过多进度
+      if (turnCount % SAVE_INTERVAL === 0) {
+        await store.save(session);
+      }
       prompt();
     });
   }
