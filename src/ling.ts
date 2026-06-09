@@ -11,13 +11,14 @@ import { PermissionGuard, loadPermissionConfig } from "./permissions/index.js";
 import { StreamChunk } from "./streaming/types.js";
 import { ToolCallCollector } from "./streaming/collector.js";
 import { StreamRenderer } from "./streaming/renderer.js";
+import { SessionStore, SessionSummary, Session, SessionMetadata } from "./session/index.ts";
 
 
 type Tool = OpenAI.Chat.ChatCompletionTool;
-type Message = OpenAI.Chat.ChatCompletionMessageParam;
 
 const config = loadPermissionConfig();
 const guard = new PermissionGuard(config);
+const MODEL = process.env.LLM_MODEL || "doubao-1.5-pro-32k-250115";
 
 interface CliArgs {
   continue: boolean;       // --continue：恢复最近一次会话
@@ -52,11 +53,27 @@ function parseArgs(argv: string[]): CliArgs {
   return args;
 }
 
+function detectMetadata(): SessionMetadata {
+  let gitBranch: string | undefined;
+  try {
+    gitBranch = execSync("git branch --show-current", { encoding: "utf-8" }).trim();
+  } catch {
+    // 不在 git 仓库内，忽略
+  }
+
+  return {
+    cwd: process.cwd(),
+    provider: "openai",
+    model: MODEL,
+    gitBranch,
+  };
+}
+
 const client = new OpenAI({
   apiKey: process.env.LLM_API_KEY,
   baseURL: process.env.LLM_BASE_URL || "https://ark.cn-beijing.volces.com/api/v3",
 });
-const MODEL = process.env.LLM_MODEL || "doubao-1.5-pro-32k-250115";
+
 const CONTEXT_WINDOW = parseInt(process.env.CONTEXT_WINDOW || "32000", 10);
 
 // ===== 工具定义 =====
@@ -99,9 +116,57 @@ function executeTool(name: string, args: Record<string, string>): string {
 }
 
 async function main() {
-  
+  const args = parseArgs(process.argv);
+  const store = new SessionStore();
+
+  // --list-sessions：打印后退出
+  if (args.listSessions) {
+    const sessions = await store.list();
+    if (sessions.length === 0) {
+      console.log("No sessions found.");
+      return;
+    }
+    console.log("Sessions:\n");
+    for (const s of sessions) {
+      const date = new Date(s.updatedAt).toLocaleString();
+      const label = s.name ? `"${s.name}"` : s.id.slice(0, 8);
+      const preview = s.lastUserMessage ?? "(empty)";
+      console.log(`  ${label}  ${s.messageCount} msgs  ${date}`);
+      console.log(`    ${preview}\n`);
+    }
+    return;
+  }
+
+  // 决定是新建还是恢复会话
+  let session: Session;
+
+  if (args.continue) {
+    const latestId = await store.getLatestId();
+    if (!latestId) {
+      console.log("No previous session found. Starting new session.");
+      session = await store.create(detectMetadata(), args.name);
+    } else {
+      session = (await store.load(latestId))!;
+      console.log(`Resuming session ${session.id.slice(0, 8)}...`
+        + ` (${session.messages.length} messages)`);
+    }
+  } else if (args.resume) {
+    const loaded = await store.load(args.resume);
+    if (!loaded) {
+      console.error(`Session not found: ${args.resume}`);
+      process.exit(1);
+    }
+    session = loaded;
+    console.log(`Resuming session ${session.id.slice(0, 8)}...`
+      + ` (${session.messages.length} messages)`);
+  } else {
+    session = await store.create(detectMetadata(), args.name);
+    console.log(`New session: ${session.id.slice(0, 8)}`);
+  }
+
   // 支持通过命令行参数指定工作目录
-  const workDir = process.argv[2];
+  const rawFirst = process.argv[2];
+  const workDir = rawFirst && !rawFirst.startsWith("-") ? rawFirst : undefined;
   if (workDir) {
     try {
       // 切换到指定的工作目录
@@ -127,22 +192,28 @@ async function main() {
 
   // ===== Agent 主循环 =====
 
-  let messages: Message[] = [{ role: "system", content: systemPrompt }];
+  // 给 session 注入/更新 system prompt
+  const sysIdx = session.messages.findIndex((m) => m.role === "system");
+  if (sysIdx >= 0) {
+    session.messages[sysIdx] = { role: "system", content: systemPrompt };
+  } else {
+    session.messages.unshift({ role: "system", content: systemPrompt });
+  }
 
   async function handleTurn(userMessage: string) {
     // /compact 命令：手动触发压缩
     if (userMessage.trim() === "/compact") {
-      messages = await compactor.compact(messages);
+      session.messages = await compactor.compact(session.messages);
       console.log("[ling] Conversation compacted.");
       return;
     }
 
-    messages.push({ role: "user", content: userMessage });
+    session.messages.push({ role: "user", content: userMessage });
 
     // 自动压缩检查
-    if (compactor.shouldCompact(messages)) {
+    if (compactor.shouldCompact(session.messages)) {
       console.log("[ling] Context getting large, auto-compacting...");
-      messages = await compactor.compact(messages);
+      session.messages = await compactor.compact(session.messages);
     }
 
     const MAX_TURNS = 20;
@@ -154,7 +225,7 @@ async function main() {
       // ---- 流式请求 ----
       const stream = await client.chat.completions.create({
         model: MODEL,
-        messages,
+        messages: session.messages,
         tools,
         stream: true,
       });
@@ -223,7 +294,7 @@ async function main() {
       }
 
       // 将 assistant 消息（含 tool_calls）写入历史
-      messages.push({
+      session.messages.push({
         role: "assistant",
         content: collectedContent || null,
         tool_calls: toolCalls.map((tc) => ({
@@ -243,7 +314,7 @@ async function main() {
 
         if (!allowed) {
           renderer.stopToolExecution(tc.name, false);
-          messages.push({
+          session.messages.push({
             role: "tool",
             tool_call_id: tc.id,
             content: `Permission denied: this operation was blocked by the permission system. Try a different approach.`,
@@ -253,7 +324,7 @@ async function main() {
 
         const result = executeTool(tc.name, args);
         renderer.stopToolExecution(tc.name, true);
-        messages.push({ role: "tool", tool_call_id: tc.id, content: result });
+        session.messages.push({ role: "tool", tool_call_id: tc.id, content: result });
       }
     }
 
@@ -265,7 +336,7 @@ async function main() {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
 
   function prompt() {
-    const historyTokens = estimateTokens(JSON.stringify(messages));
+    const historyTokens = estimateTokens(JSON.stringify(session.messages));
     rl.question(`[${historyTokens} tokens] > `, async (input) => {
       const trimmed = input.trim();
       if (!trimmed || trimmed === "/quit") {
@@ -273,6 +344,8 @@ async function main() {
         return;
       }
       await handleTurn(trimmed);
+      // 每轮对话后自动保存
+      await store.save(session);
       prompt();
     });
   }
